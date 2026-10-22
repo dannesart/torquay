@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { useMarks } from '~/composables/useMarks'
-import { createMarksDb } from '~/utils/marksDb'
+import { createMarksDb, type Mark, type MarksStore } from '~/utils/marksDb'
+import { marksToGeoJSON, parseMarksGeoJSON } from '~/utils/geojson'
 
 let dbCount = 0
 const freshDb = () => createMarksDb(`test-${++dbCount}`)
@@ -8,8 +9,8 @@ const freshDb = () => createMarksDb(`test-${++dbCount}`)
 describe('marksDb', () => {
   it('stores coordinates exactly and returns marks in creation order', async () => {
     const db = freshDb()
-    await db.put({ id: 'b', lng: -3.527139185476303, lat: 50.46412290637751, createdAt: 2 })
-    await db.put({ id: 'a', lng: -3.5253, lat: 50.4619, createdAt: 1 })
+    await db.putMany([{ id: 'b', lng: -3.527139185476303, lat: 50.46412290637751, createdAt: 2 }])
+    await db.putMany([{ id: 'a', lng: -3.5253, lat: 50.4619, createdAt: 1 }])
     const all = await db.getAll()
     expect(all.map((m) => m.id)).toEqual(['a', 'b'])
     expect(all[1]).toEqual({ id: 'b', lng: -3.527139185476303, lat: 50.46412290637751, createdAt: 2 })
@@ -17,10 +18,101 @@ describe('marksDb', () => {
 
   it('removes a single mark', async () => {
     const db = freshDb()
-    await db.put({ id: 'a', lng: 0, lat: 0, createdAt: 1 })
-    await db.put({ id: 'b', lng: 1, lat: 1, createdAt: 2 })
-    await db.remove('a')
+    await db.putMany([{ id: 'a', lng: 0, lat: 0, createdAt: 1 }])
+    await db.putMany([{ id: 'b', lng: 1, lat: 1, createdAt: 2 }])
+    await db.removeMany(['a'])
     expect((await db.getAll()).map((m) => m.id)).toEqual(['b'])
+  })
+
+  it('writes nothing when any mark in a batch is rejected', async () => {
+    const db = freshDb()
+    await db.putMany([{ id: 'existing', lng: 0, lat: 0, createdAt: 1 }])
+    // The second record has no id (the key path), which IndexedDB refuses synchronously.
+    const bad = [{ id: 'new', lng: 1, lat: 1, createdAt: 2 }, { lng: 2, lat: 2, createdAt: 3 } as unknown as Mark]
+    await expect(db.putMany(bad)).rejects.toThrow()
+    expect((await db.getAll()).map((m) => m.id)).toEqual(['existing'])
+  })
+})
+
+describe('importMarks', () => {
+  const imported = (n: number, offset = 0): Mark[] =>
+    Array.from({ length: n }, (_, i) => ({ id: `imp-${offset + i}`, lng: -3.52 - i * 1e-4, lat: 50.46 + i * 1e-4, createdAt: 1000 + offset + i }))
+
+  it('adds new marks, skips identical ones, keeps existing marks on conflict, and persists', async () => {
+    const name = `test-${++dbCount}`
+    const s = useMarks(createMarksDb(name))
+    await s.load()
+    const own = s.add(-3.53, 50.47)
+    const file = parseMarksGeoJSON(marksToGeoJSON([own, { ...own, id: 'imp-x', lat: 50.48 }]))
+    const conflicting = { ...own, lng: 0 } // same id, moved
+
+    const plan = await s.importMarks([...file, conflicting])
+    expect(plan.added.map((m) => m.id)).toEqual(['imp-x'])
+    expect(plan.skipped).toEqual([own])
+    expect(plan.conflicts).toEqual([conflicting])
+    expect(s.marks.value.find((m) => m.id === own.id)).toEqual(own) // not overwritten
+
+    const reloaded = useMarks(createMarksDb(name))
+    await reloaded.load()
+    expect(reloaded.marks.value.map((m) => m.id).sort()).toEqual([own.id, 'imp-x'].sort())
+    expect(reloaded.marks.value.find((m) => m.id === own.id)).toEqual(own)
+  })
+
+  it('undoes and redoes an import as one step without touching earlier marks or history', async () => {
+    const db = freshDb()
+    const s = useMarks(db)
+    await s.load()
+    const first = s.add(1, 1)
+    const second = s.add(2, 2)
+    await s.importMarks(imported(5))
+    expect(s.marks.value).toHaveLength(7)
+
+    s.undo()
+    expect(s.marks.value).toEqual([first, second])
+    await s.flush()
+    expect(await db.getAll()).toEqual([first, second])
+
+    s.redo()
+    expect(s.marks.value).toHaveLength(7)
+    await s.flush()
+    expect(await db.getAll()).toHaveLength(7)
+
+    s.undo() // the import
+    s.undo() // then the earlier history is intact: removes `second`
+    expect(s.marks.value).toEqual([first])
+  })
+
+  it('leaves state, storage and history untouched when the batch write fails', async () => {
+    const real = freshDb()
+    const failing: MarksStore = { ...real, putMany: async (marks) => (marks.length > 1 ? Promise.reject(new Error('disk full')) : real.putMany(marks)) }
+    const s = useMarks(failing)
+    await s.load()
+    const own = s.add(1, 1)
+
+    await expect(s.importMarks(imported(3))).rejects.toThrow('disk full')
+    expect(s.marks.value).toEqual([own])
+    expect(await real.getAll()).toEqual([own])
+    s.undo() // still undoes the last real action, not a phantom import
+    expect(s.marks.value).toEqual([])
+  })
+
+  it('does not record an undo step when nothing is new', async () => {
+    const s = useMarks(freshDb())
+    await s.load()
+    const own = s.add(1, 1)
+    const plan = await s.importMarks([own])
+    expect(plan.added).toEqual([])
+    s.undo()
+    expect(s.marks.value).toEqual([])
+  })
+
+  it('exports every stored mark', async () => {
+    const s = useMarks(freshDb())
+    await s.load()
+    s.add(1, 1)
+    await s.importMarks(imported(3))
+    const exported = parseMarksGeoJSON(marksToGeoJSON(await s.allStored()))
+    expect(exported).toEqual(s.marks.value)
   })
 })
 
@@ -152,7 +244,7 @@ describe('useMarks', () => {
   it('keeps marks added before loading finished', async () => {
     const name = `test-${++dbCount}`
     const db = createMarksDb(name)
-    await db.put({ id: 'old', lng: 0, lat: 0, createdAt: 1 })
+    await db.putMany([{ id: 'old', lng: 0, lat: 0, createdAt: 1 }])
     const s = useMarks(createMarksDb(name))
     const loading = s.load()
     s.add(5, 5)

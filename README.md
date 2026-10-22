@@ -41,12 +41,17 @@ one zoom level deeper, which sharpens zoomed-out views (at the cost of more tile
 - **Esc** returns to Navigate.
 - **Ctrl+Z** undo, **Ctrl+Shift+Z** (or Ctrl+Y) redo. Undo history covers the current session only.
 - Marks save automatically and survive a refresh. They live in this browser only:
-  clearing site data deletes them.
+  clearing site data deletes them, so export regularly.
+- **⤓ Export** downloads every mark as `mapmarks-YYYY-MM-DD.geojson` (a standard GeoJSON
+  FeatureCollection of Points with each mark's id, type and `createdAt`, plus `"mapmarks": { "version": 1 }`).
+- **⤒ Import** merges a MapMarks export into the current marks. The whole file is validated first and saved
+  in one transaction; marks already present are skipped, and a mark whose id exists with different data is
+  reported as a conflict and the existing mark is kept. Nothing is ever cleared. Ctrl+Z undoes the whole import.
 
 ## Scripts
 
 ```sh
-npm test            # unit tests (marks, undo/redo, IndexedDB, map styles, hit testing)
+npm test            # unit tests (marks, undo/redo, IndexedDB, import/export, map styles, hit testing)
 npm run typecheck
 npm run generate    # static build in .output/public
 ```

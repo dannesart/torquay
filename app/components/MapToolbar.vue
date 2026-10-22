@@ -2,9 +2,28 @@
 import type { Mode } from './MapView.vue'
 import { MAP_STYLES, type MapStyleId } from '~/utils/mapStyles'
 
-defineProps<{ count: number; saveError: string | null; imageryError: string | null; hasKey: boolean }>()
+export interface Status {
+  text: string
+  kind: 'info' | 'warn' | 'error'
+}
+
+defineProps<{
+  count: number
+  saveError: string | null
+  imageryError: string | null
+  hasKey: boolean
+  status: Status | null
+}>()
+const emit = defineEmits<{ export: []; import: [file: File]; dismissStatus: [] }>()
 const mode = defineModel<Mode>('mode', { required: true })
 const mapStyle = defineModel<MapStyleId>('mapStyle', { required: true })
+
+const fileInput = ref<HTMLInputElement>()
+function onFileChosen() {
+  const file = fileInput.value?.files?.[0]
+  if (file) emit('import', file)
+  fileInput.value!.value = '' // allow choosing the same file again
+}
 
 const modes: { value: Mode; label: string; title: string }[] = [
   { value: 'navigate', label: '✋', title: 'Navigate' },
@@ -39,7 +58,21 @@ const modes: { value: Mode; label: string; title: string }[] = [
       >
         {{ s.label }}
       </button>
+      <span class="divider" />
+      <button class="file" title="Export all marks as GeoJSON" @click="emit('export')">⤓</button>
+      <button class="file" title="Import marks from a MapMarks GeoJSON file" @click="fileInput?.click()">⤒</button>
+      <input
+        ref="fileInput"
+        type="file"
+        accept=".geojson,.json,application/geo+json,application/json"
+        hidden
+        @change="onFileChosen"
+      >
       <span v-if="saveError" class="error" :title="saveError">Not saved!</span>
+    </div>
+    <div v-if="status" :class="['notice', 'status', status.kind]" role="status">
+      {{ status.text }}
+      <button class="dismiss" title="Dismiss" @click="emit('dismissStatus')">×</button>
     </div>
     <div v-if="imageryError" class="notice" role="alert">
       Satellite imagery unavailable: {{ imageryError }}
@@ -144,5 +177,27 @@ button:hover:not(:disabled) {
 }
 .notice button:hover {
   background: #5c2e00;
+}
+.file {
+  width: 28px;
+  height: 28px;
+  font-size: 15px;
+}
+.status.info {
+  background: rgba(255, 255, 255, 0.95);
+  color: #222;
+}
+.status.error {
+  background: rgba(255, 235, 235, 0.97);
+  color: #a00;
+}
+.notice .dismiss {
+  padding: 0 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+}
+.notice .dismiss:hover {
+  background: rgba(0, 0, 0, 0.08);
 }
 </style>

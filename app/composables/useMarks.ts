@@ -1,7 +1,11 @@
 import { ref, shallowRef } from 'vue'
 import type { Mark, MarksStore } from '~/utils/marksDb'
+import { planImport, type ImportPlan } from '~/utils/geojson'
 
-type Action = { type: 'add' | 'remove'; mark: Mark }
+/** One undoable step. An import is a single 'add' of many marks. */
+type Action = { type: 'add' | 'remove'; marks: Mark[] }
+
+const byCreation = (a: Mark, b: Mark) => a.createdAt - b.createdAt
 
 /**
  * Mark state with undo/redo. Every change is written to the store immediately;
@@ -29,14 +33,15 @@ export function useMarks(store: MarksStore) {
 
   function apply(action: Action, reverse: boolean) {
     const adding = (action.type === 'add') !== reverse
-    const { mark } = action
+    const ids = new Set(action.marks.map((m) => m.id))
+    // Filtering by id first means restoring marks can never duplicate them.
+    const others = marks.value.filter((m) => !ids.has(m.id))
     if (adding) {
-      // Filtering by id first means restoring a mark can never duplicate it.
-      marks.value = [...marks.value.filter((m) => m.id !== mark.id), mark].sort((a, b) => a.createdAt - b.createdAt)
-      persist(() => store.put(mark))
+      marks.value = [...others, ...action.marks].sort(byCreation)
+      persist(() => store.putMany(action.marks))
     } else {
-      marks.value = marks.value.filter((m) => m.id !== mark.id)
-      persist(() => store.remove(mark.id))
+      marks.value = others
+      persist(() => store.removeMany([...ids]))
     }
   }
 
@@ -50,13 +55,36 @@ export function useMarks(store: MarksStore) {
     // Strictly increasing so order survives reloads even for marks made within the same millisecond.
     const last = marks.value.at(-1)?.createdAt ?? 0
     const mark: Mark = { id: crypto.randomUUID(), lng, lat, createdAt: Math.max(Date.now(), last + 1) }
-    record({ type: 'add', mark })
+    record({ type: 'add', marks: [mark] })
     return mark
   }
 
   function remove(id: string) {
     const mark = marks.value.find((m) => m.id === id)
-    if (mark) record({ type: 'remove', mark })
+    if (mark) record({ type: 'remove', marks: [mark] })
+  }
+
+  /**
+   * Merges validated marks into the investigation as one undoable step. New marks are written in a
+   * single transaction before any state changes, so a failed write rejects and leaves everything as it was.
+   */
+  async function importMarks(incoming: Mark[]): Promise<ImportPlan> {
+    const plan = planImport(marks.value, incoming)
+    if (plan.added.length === 0) return plan
+    const write = writes.then(() => store.putMany(plan.added))
+    writes = write.catch(() => {}) // the caller reports this failure; later writes still run
+    await write
+    const ids = new Set(plan.added.map((m) => m.id))
+    marks.value = [...marks.value.filter((m) => !ids.has(m.id)), ...plan.added].sort(byCreation)
+    undoStack.push({ type: 'add', marks: plan.added })
+    redoStack.length = 0
+    return plan
+  }
+
+  /** Every stored mark, read back from the store once pending writes have finished. */
+  async function allStored(): Promise<Mark[]> {
+    await writes
+    return store.getAll()
   }
 
   function undo() {
@@ -76,5 +104,5 @@ export function useMarks(store: MarksStore) {
   /** Resolves once all pending writes have finished. */
   const flush = () => writes
 
-  return { marks, saveError, load, add, remove, undo, redo, flush }
+  return { marks, saveError, load, add, remove, importMarks, allStored, undo, redo, flush }
 }
