@@ -1,4 +1,5 @@
-import { openDB, type IDBPDatabase, type IDBPObjectStore } from 'idb'
+import { openDB } from 'idb'
+import type { LngLat } from '~/utils/polygon'
 
 export interface Mark {
   id: string
@@ -7,51 +8,77 @@ export interface Mark {
   createdAt: number
 }
 
+/** An excluded area. `ring` is open (first vertex not repeated) and counterclockwise. */
+export interface Polygon {
+  id: string
+  ring: LngLat[]
+  createdAt: number
+}
+
+export interface Investigation {
+  marks: Mark[]
+  polygons: Polygon[]
+}
+
+export interface Changes {
+  putMarks?: Mark[]
+  removeMarks?: string[]
+  putPolygons?: Polygon[]
+  removePolygons?: string[]
+}
+
 export interface MarksStore {
   getAll(): Promise<Mark[]>
-  /** Writes all marks in one transaction: either every mark is stored or none is. */
-  putMany(marks: Mark[]): Promise<void>
-  /** Deletes all ids in one transaction. */
-  removeMany(ids: string[]): Promise<void>
+  getAllPolygons(): Promise<Polygon[]>
+  /** Applies all changes in one transaction: either every change is stored or none is. */
+  write(changes: Changes): Promise<void>
 }
 
-const STORE = 'marks' as const
-type Store = IDBPObjectStore<unknown, [typeof STORE], typeof STORE, 'readwrite'>
+const MARKS = 'marks'
+const POLYGONS = 'polygons'
+const byCreation = (a: { createdAt: number }, b: { createdAt: number }) => a.createdAt - b.createdAt
 
-/**
- * Runs `op` for every item inside one readwrite transaction. Any failure, including a request that throws
- * synchronously (e.g. an invalid key), aborts the transaction so none of the changes are committed.
- */
-async function inOneTransaction<T>(db: Promise<IDBPDatabase>, items: T[], op: (store: Store, item: T) => Promise<unknown>) {
-  const tx = (await db).transaction(STORE, 'readwrite')
-  const pending: Promise<unknown>[] = [tx.done]
-  try {
-    for (const item of items) pending.push(op(tx.store, item))
-    await Promise.all(pending)
-  } catch (err) {
-    pending.forEach((p) => p.catch(() => {})) // they all reject once aborted; report only the cause
-    try {
-      tx.abort()
-    } catch {
-      // Already aborted by the failed request.
-    }
-    throw err
-  }
-}
-
-export function createMarksDb(name = 'mapmarks'): MarksStore {
-  const db = openDB(name, 1, {
-    upgrade(db) {
-      db.createObjectStore(STORE, { keyPath: 'id' })
+export function createMarksDb(name = 'mapmarks', onBlocked?: () => void): MarksStore {
+  const db = openDB(name, 2, {
+    // Additive only: existing stores and their records are never deleted or rewritten.
+    upgrade(db, oldVersion) {
+      if (oldVersion < 1) db.createObjectStore(MARKS, { keyPath: 'id' })
+      if (oldVersion < 2) db.createObjectStore(POLYGONS, { keyPath: 'id' })
     },
+    // Another tab still has the old version open; the upgrade waits until it closes.
+    blocked: () => onBlocked?.(),
   })
 
   return {
     async getAll() {
-      const marks: Mark[] = await (await db).getAll(STORE)
-      return marks.sort((a, b) => a.createdAt - b.createdAt)
+      const marks: Mark[] = await (await db).getAll(MARKS)
+      return marks.sort(byCreation)
     },
-    putMany: (marks) => inOneTransaction(db, marks, (store, mark) => store.put(mark)),
-    removeMany: (ids) => inOneTransaction(db, ids, (store, id) => store.delete(id)),
+    async getAllPolygons() {
+      const polygons: Polygon[] = await (await db).getAll(POLYGONS)
+      return polygons.sort(byCreation)
+    },
+    async write(changes) {
+      const tx = (await db).transaction([MARKS, POLYGONS], 'readwrite')
+      const marks = tx.objectStore(MARKS)
+      const polygons = tx.objectStore(POLYGONS)
+      const pending: Promise<unknown>[] = [tx.done]
+      try {
+        // A request that throws synchronously (e.g. a missing key) must still abort the whole transaction.
+        for (const m of changes.putMarks ?? []) pending.push(marks.put(m))
+        for (const id of changes.removeMarks ?? []) pending.push(marks.delete(id))
+        for (const p of changes.putPolygons ?? []) pending.push(polygons.put(p))
+        for (const id of changes.removePolygons ?? []) pending.push(polygons.delete(id))
+        await Promise.all(pending)
+      } catch (err) {
+        pending.forEach((p) => p.catch(() => {})) // they all reject once aborted; report only the cause
+        try {
+          tx.abort()
+        } catch {
+          // Already aborted by the failed request.
+        }
+        throw err
+      }
+    },
   }
 }

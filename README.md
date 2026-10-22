@@ -36,14 +36,21 @@ one zoom level deeper, which sharpens zoomed-out views (at the cost of more tile
 - **✋ Navigate**: pan/zoom as normal.
 - **✕ Red X**: every click places a red cross. Dragging still pans; the mode stays on until you switch.
 - **Street / Satellite / Hybrid**: switch the map style. The view and all marks stay put; the choice is remembered.
-- **⌫ Eraser**: click a cross to remove it. Empty space and drags do nothing; the mode stays on until you switch.
-- **Right-click** a cross to remove it in any mode.
-- **Esc** returns to Navigate.
+- **⬠ Exclusion area**: click to add corners (a live preview follows the pointer); double-click, Enter or a
+  click on the first corner finishes. Backspace removes the last corner, Esc cancels. Outlines whose edges cross
+  are refused. The mode stays on so you can draw the next area straight away. Areas never add or remove crosses.
+- **Editing an area**: in Navigate, click an area to select it, then drag its corner handles. An edit is applied
+  when you release, only if the outline stays valid; Esc while dragging reverts. Delete removes the selected area.
+- **⌫ Eraser**: click a cross or an area to remove it; the target is highlighted before you click. A cross wins
+  over the area beneath it, and clicks just beside a cross remove nothing. Empty space and drags do nothing.
+- **Right-click** a cross or area to remove it in any mode.
+- **Esc** cancels a drawing or selection first, then returns to Navigate.
 - **Ctrl+Z** undo, **Ctrl+Shift+Z** (or Ctrl+Y) redo. Undo history covers the current session only.
 - Marks save automatically and survive a refresh. They live in this browser only:
   clearing site data deletes them, so export regularly.
-- **⤓ Export** downloads every mark as `mapmarks-YYYY-MM-DD.geojson` (a standard GeoJSON
-  FeatureCollection of Points with each mark's id, type and `createdAt`, plus `"mapmarks": { "version": 1 }`).
+- **⤓ Export** downloads every mark and area as `mapmarks-YYYY-MM-DD.geojson`: a standard GeoJSON
+  FeatureCollection of Points (`"type": "red-x"`) and closed Polygons (`"type": "exclusion-area"`), each with its
+  id and `createdAt`, plus `"mapmarks": { "version": 2 }`. Version 1 backups (crosses only) still import.
 - **⤒ Import** merges a MapMarks export into the current marks. The whole file is validated first and saved
   in one transaction; marks already present are skipped, and a mark whose id exists with different data is
   reported as a conflict and the existing mark is kept. Nothing is ever cleared. Ctrl+Z undoes the whole import.
@@ -51,7 +58,7 @@ one zoom level deeper, which sharpens zoomed-out views (at the cost of more tile
 ## Scripts
 
 ```sh
-npm test            # unit tests (marks, undo/redo, IndexedDB, import/export, map styles, hit testing)
+npm test            # unit tests (marks, areas, undo/redo, IndexedDB, import/export, map styles, hit testing)
 npm run typecheck
 npm run generate    # static build in .output/public
 ```

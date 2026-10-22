@@ -1,47 +1,68 @@
 import { ref, shallowRef } from 'vue'
-import type { Mark, MarksStore } from '~/utils/marksDb'
+import type { Changes, Investigation, Mark, MarksStore, Polygon } from '~/utils/marksDb'
 import { planImport, type ImportPlan } from '~/utils/geojson'
+import { counterClockwise, ringProblem, sameRing, type LngLat } from '~/utils/polygon'
 
-/** One undoable step. An import is a single 'add' of many marks. */
-type Action = { type: 'add' | 'remove'; marks: Mark[] }
+/** One undoable step. An import is a single 'add' of many marks and polygons. */
+type Action =
+  | { type: 'add' | 'remove'; marks: Mark[]; polygons: Polygon[] }
+  | { type: 'update'; before: Polygon; after: Polygon }
 
-const byCreation = (a: Mark, b: Mark) => a.createdAt - b.createdAt
+const byCreation = (a: { createdAt: number }, b: { createdAt: number }) => a.createdAt - b.createdAt
+
+/** Replaces items with the same ids (so restoring never duplicates) and keeps creation order. */
+function upsert<T extends { id: string; createdAt: number }>(list: T[], items: T[]): T[] {
+  const ids = new Set(items.map((i) => i.id))
+  return [...list.filter((i) => !ids.has(i.id)), ...items].sort(byCreation)
+}
+
+/** Strictly increasing so order survives reloads even for items made within the same millisecond. */
+const nextCreatedAt = (list: { createdAt: number }[]) => Math.max(Date.now(), (list.at(-1)?.createdAt ?? 0) + 1)
 
 /**
- * Mark state with undo/redo. Every change is written to the store immediately;
+ * Marks and exclusion polygons with undo/redo. Every change is written to the store immediately;
  * writes are chained so they reach IndexedDB in the order they were made.
  */
 export function useMarks(store: MarksStore) {
   const marks = shallowRef<Mark[]>([])
+  const polygons = shallowRef<Polygon[]>([])
   const saveError = ref<string | null>(null)
   const undoStack: Action[] = []
   const redoStack: Action[] = []
 
   let writes: Promise<void> = Promise.resolve()
-  function persist(write: () => Promise<void>) {
-    writes = writes.then(write).catch((err) => {
+  function persist(changes: Changes) {
+    writes = writes.then(() => store.write(changes)).catch((err) => {
       console.error('MapMarks: failed to save', err)
       saveError.value = String(err)
     })
   }
 
   async function load() {
-    const stored = await store.getAll()
+    const [storedMarks, storedPolygons] = await Promise.all([store.getAll(), store.getAllPolygons()])
     // Keep anything added while loading.
-    marks.value = [...stored, ...marks.value]
+    marks.value = [...storedMarks, ...marks.value]
+    polygons.value = [...storedPolygons, ...polygons.value]
   }
 
   function apply(action: Action, reverse: boolean) {
+    if (action.type === 'update') {
+      const polygon = reverse ? action.before : action.after
+      polygons.value = upsert(polygons.value, [polygon])
+      persist({ putPolygons: [polygon] })
+      return
+    }
     const adding = (action.type === 'add') !== reverse
-    const ids = new Set(action.marks.map((m) => m.id))
-    // Filtering by id first means restoring marks can never duplicate them.
-    const others = marks.value.filter((m) => !ids.has(m.id))
     if (adding) {
-      marks.value = [...others, ...action.marks].sort(byCreation)
-      persist(() => store.putMany(action.marks))
+      marks.value = upsert(marks.value, action.marks)
+      polygons.value = upsert(polygons.value, action.polygons)
+      persist({ putMarks: action.marks, putPolygons: action.polygons })
     } else {
-      marks.value = others
-      persist(() => store.removeMany([...ids]))
+      const markIds = new Set(action.marks.map((m) => m.id))
+      const polygonIds = new Set(action.polygons.map((p) => p.id))
+      marks.value = marks.value.filter((m) => !markIds.has(m.id))
+      polygons.value = polygons.value.filter((p) => !polygonIds.has(p.id))
+      persist({ removeMarks: [...markIds], removePolygons: [...polygonIds] })
     }
   }
 
@@ -52,39 +73,64 @@ export function useMarks(store: MarksStore) {
   }
 
   function add(lng: number, lat: number): Mark {
-    // Strictly increasing so order survives reloads even for marks made within the same millisecond.
-    const last = marks.value.at(-1)?.createdAt ?? 0
-    const mark: Mark = { id: crypto.randomUUID(), lng, lat, createdAt: Math.max(Date.now(), last + 1) }
-    record({ type: 'add', marks: [mark] })
+    const mark: Mark = { id: crypto.randomUUID(), lng, lat, createdAt: nextCreatedAt(marks.value) }
+    record({ type: 'add', marks: [mark], polygons: [] })
     return mark
   }
 
   function remove(id: string) {
     const mark = marks.value.find((m) => m.id === id)
-    if (mark) record({ type: 'remove', marks: [mark] })
+    if (mark) record({ type: 'remove', marks: [mark], polygons: [] })
+  }
+
+  /** Saves a finished polygon. Callers validate first; an invalid ring here is a bug and is refused. */
+  function addPolygon(ring: LngLat[]): Polygon {
+    const problem = ringProblem(ring)
+    if (problem) throw new Error(`Invalid polygon: ${problem}`)
+    const polygon: Polygon = { id: crypto.randomUUID(), ring: counterClockwise(ring), createdAt: nextCreatedAt(polygons.value) }
+    record({ type: 'add', marks: [], polygons: [polygon] })
+    return polygon
+  }
+
+  /** Commits an edited outline as one undoable step; only that polygon changes. */
+  function updatePolygon(id: string, ring: LngLat[]) {
+    const before = polygons.value.find((p) => p.id === id)
+    if (!before) return
+    const problem = ringProblem(ring)
+    if (problem) throw new Error(`Invalid polygon: ${problem}`)
+    const after: Polygon = { ...before, ring: counterClockwise(ring) }
+    if (sameRing(before.ring, after.ring)) return
+    record({ type: 'update', before, after })
+  }
+
+  function removePolygon(id: string) {
+    const polygon = polygons.value.find((p) => p.id === id)
+    if (polygon) record({ type: 'remove', marks: [], polygons: [polygon] })
   }
 
   /**
-   * Merges validated marks into the investigation as one undoable step. New marks are written in a
+   * Merges validated data into the investigation as one undoable step. New items are written in a
    * single transaction before any state changes, so a failed write rejects and leaves everything as it was.
    */
-  async function importMarks(incoming: Mark[]): Promise<ImportPlan> {
-    const plan = planImport(marks.value, incoming)
-    if (plan.added.length === 0) return plan
-    const write = writes.then(() => store.putMany(plan.added))
+  async function importData(incoming: Investigation): Promise<ImportPlan> {
+    const plan = planImport({ marks: marks.value, polygons: polygons.value }, incoming)
+    const { added } = plan
+    if (added.marks.length + added.polygons.length === 0) return plan
+    const write = writes.then(() => store.write({ putMarks: added.marks, putPolygons: added.polygons }))
     writes = write.catch(() => {}) // the caller reports this failure; later writes still run
     await write
-    const ids = new Set(plan.added.map((m) => m.id))
-    marks.value = [...marks.value.filter((m) => !ids.has(m.id)), ...plan.added].sort(byCreation)
-    undoStack.push({ type: 'add', marks: plan.added })
+    marks.value = upsert(marks.value, added.marks)
+    polygons.value = upsert(polygons.value, added.polygons)
+    undoStack.push({ type: 'add', marks: added.marks, polygons: added.polygons })
     redoStack.length = 0
     return plan
   }
 
-  /** Every stored mark, read back from the store once pending writes have finished. */
-  async function allStored(): Promise<Mark[]> {
+  /** Everything stored, read back from the store once pending writes have finished. */
+  async function allStored(): Promise<Investigation> {
     await writes
-    return store.getAll()
+    const [storedMarks, storedPolygons] = await Promise.all([store.getAll(), store.getAllPolygons()])
+    return { marks: storedMarks, polygons: storedPolygons }
   }
 
   function undo() {
@@ -104,5 +150,8 @@ export function useMarks(store: MarksStore) {
   /** Resolves once all pending writes have finished. */
   const flush = () => writes
 
-  return { marks, saveError, load, add, remove, importMarks, allStored, undo, redo, flush }
+  return {
+    marks, polygons, saveError, load, add, remove, addPolygon, updatePolygon, removePolygon,
+    importData, allStored, undo, redo, flush,
+  }
 }

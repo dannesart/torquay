@@ -9,6 +9,7 @@ export interface Status {
 
 defineProps<{
   count: number
+  areaCount: number
   saveError: string | null
   imageryError: string | null
   hasKey: boolean
@@ -26,9 +27,14 @@ function onFileChosen() {
 }
 
 const modes: { value: Mode; label: string; title: string }[] = [
-  { value: 'navigate', label: '✋', title: 'Navigate' },
+  { value: 'navigate', label: '✋', title: 'Navigate · click an area to select it, then drag its corners to edit' },
   { value: 'red-x', label: '✕', title: 'Red X: click to mark' },
-  { value: 'eraser', label: '⌫', title: 'Eraser: click a mark to remove it (Esc to stop)' },
+  {
+    value: 'polygon',
+    label: '⬠',
+    title: 'Exclusion area: click to add corners · double-click or Enter to finish · Backspace removes the last corner · Esc cancels',
+  },
+  { value: 'eraser', label: '⌫', title: 'Eraser: click a mark or area to remove it (Esc to stop)' },
 ]
 </script>
 
@@ -45,7 +51,9 @@ const modes: { value: Mode; label: string; title: string }[] = [
       >
         {{ m.label }}
       </button>
-      <span class="count" title="Eraser or right-click removes a mark · Ctrl+Z undo · Ctrl+Shift+Z redo · Esc navigate">{{ count }}</span>
+      <span class="count" title="Marks · excluded areas — Eraser or right-click removes · Ctrl+Z undo · Ctrl+Shift+Z redo · Esc navigate">
+        {{ count }}<template v-if="areaCount"> · ⬠{{ areaCount }}</template>
+      </span>
       <span class="divider" />
       <button
         v-for="s in MAP_STYLES"
